@@ -1,3 +1,6 @@
+#123456789067
+
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -386,6 +389,107 @@ def add_to_cart(item: CartItem):
         "message": "Product added to cart",
         "cart": cart_result,
         "ai_product_recommendations": ai_product_recommendations
+    }
+
+
+# ---- Cart item quantity and removal endpoints ----
+
+@app.patch("/cart/items/{product_id}/increase")
+def increase_cart_item(product_id: int):
+    product = next((p for p in products if p["id"] == product_id), None)
+
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    existing_item = next(
+        (cart_item for cart_item in cart if cart_item["product_id"] == product_id),
+        None
+    )
+
+    if existing_item:
+        existing_item["quantity"] += 1
+    else:
+        cart.append({
+            "product_id": product_id,
+            "quantity": 1
+        })
+
+    cart_result = get_cart_product_details()
+    ai_product_recommendations = get_ai_product_recommendations()
+
+    return {
+        "message": "Cart item quantity increased",
+        "message_ko": "장바구니 상품 수량이 증가했습니다.",
+        "cart": cart_result,
+        "ai_product_recommendations": ai_product_recommendations
+    }
+
+
+@app.patch("/cart/items/{product_id}/decrease")
+def decrease_cart_item(product_id: int):
+    existing_item = next(
+        (cart_item for cart_item in cart if cart_item["product_id"] == product_id),
+        None
+    )
+
+    if existing_item is None:
+        raise HTTPException(status_code=404, detail="Cart item not found")
+
+    existing_item["quantity"] -= 1
+
+    if existing_item["quantity"] <= 0:
+        cart.remove(existing_item)
+
+    cart_result = get_cart_product_details()
+    ai_product_recommendations = get_ai_product_recommendations()
+
+    return {
+        "message": "Cart item quantity decreased",
+        "message_ko": "장바구니 상품 수량이 감소했습니다.",
+        "cart": cart_result,
+        "ai_product_recommendations": ai_product_recommendations
+    }
+
+
+@app.delete("/cart/items/{product_id}")
+def remove_cart_item(product_id: int):
+    existing_item = next(
+        (cart_item for cart_item in cart if cart_item["product_id"] == product_id),
+        None
+    )
+
+    if existing_item is None:
+        raise HTTPException(status_code=404, detail="Cart item not found")
+
+    cart.remove(existing_item)
+
+    cart_result = get_cart_product_details()
+    ai_product_recommendations = get_ai_product_recommendations()
+
+    return {
+        "message": "Cart item removed",
+        "message_ko": "장바구니 상품이 삭제되었습니다.",
+        "cart": cart_result,
+        "ai_product_recommendations": ai_product_recommendations
+    }
+
+
+@app.delete("/cart")
+def clear_cart():
+    cart.clear()
+
+    return {
+        "message": "Cart cleared",
+        "message_ko": "장바구니가 비워졌습니다.",
+        "cart": {
+            "items": [],
+            "total_price": 0
+        },
+        "ai_product_recommendations": {
+            "show_popup": False,
+            "message_ko": "",
+            "recommendations": []
+        }
     }
 
 
@@ -1145,6 +1249,7 @@ def checkout(request: CheckoutRequest):
     order = {
         "order_id": next_order_id,
         "status": "pending",
+        "pickup_status": "start",
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "items": order_items,
         "total_price": cart_result["total_price"],
@@ -1378,15 +1483,15 @@ def convert_order_to_admin_order(order):
 
     first_shop_id = min(shop_ids) if shop_ids else None
 
+    pickup_status = order.get("pickup_status", "start")
+
     if order["status"] == "completed":
         order_stage = "complete"
         pickup_status = "done"
     elif order["status"] in ["picking", "progress"]:
         order_stage = "progress"
-        pickup_status = "moving"
     else:
         order_stage = "new"
-        pickup_status = "start"
 
     return {
         "id": order["order_id"],
@@ -1454,15 +1559,28 @@ def update_admin_order_stage(order_id: int, payload: dict):
     if order is None:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    next_stage = payload.get("orderStage") or payload.get("order_stage") or payload.get("stage")
+    order_stage = payload.get("orderStage") or payload.get("order_stage")
+    pickup_stage = payload.get("stage") or payload.get("pickupStatus") or payload.get("pickup_status")
 
-    if next_stage in ["complete", "done"]:
+    if pickup_stage in ["start", "moving", "done"]:
+        order["pickup_status"] = pickup_stage
+
+        if pickup_stage == "start" and order["status"] != "completed":
+            order["status"] = "pending"
+        elif pickup_stage in ["moving", "done"] and order["status"] != "completed":
+            order["status"] = "progress"
+
+    if order_stage in ["complete", "done"]:
         order["status"] = "completed"
+        order["pickup_status"] = "done"
         order["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    elif next_stage in ["progress", "moving"]:
+    elif order_stage == "progress":
         order["status"] = "progress"
-    else:
+        if order.get("pickup_status") == "start":
+            order["pickup_status"] = "moving"
+    elif order_stage == "new":
         order["status"] = "pending"
+        order["pickup_status"] = "start"
 
     return {
         "message": "Admin order stage updated",
