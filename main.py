@@ -112,8 +112,16 @@ products = [
 
 cart = []
 orders = []
-users = []
-next_user_id = 1
+users = [
+    {
+        "user_id": 1,
+        "username": "test",
+        "password": "test1",
+        "name": "테스트 고객",
+        "created_at": "test account"
+    }
+]
+next_user_id = 2
 next_order_id = 1
 HUB_LOCATION = {"name": "Logistics Hub", "x": 0, "y": 7}
 rider_state = {
