@@ -1,6 +1,3 @@
-#123456789067
-
-
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -139,9 +136,16 @@ PRODUCT_RECOMMENDATION_RULES = {
 
 
 
+
 class CartItem(BaseModel):
     product_id: int
     quantity: int
+
+
+class CartReplaceItem(BaseModel):
+    current_product_id: int
+    recommended_product_id: int
+    quantity: int | None = None
 
 
 class CustomerSignup(BaseModel):
@@ -451,6 +455,7 @@ def decrease_cart_item(product_id: int):
     }
 
 
+
 @app.delete("/cart/items/{product_id}")
 def remove_cart_item(product_id: int):
     existing_item = next(
@@ -470,6 +475,86 @@ def remove_cart_item(product_id: int):
         "message": "Cart item removed",
         "message_ko": "장바구니 상품이 삭제되었습니다.",
         "cart": cart_result,
+        "ai_product_recommendations": ai_product_recommendations
+    }
+
+
+# --- Replace cart item with cheaper same product endpoint ---
+@app.post("/cart/replace-item")
+def replace_cart_item(replace_data: CartReplaceItem):
+    current_item = next(
+        (cart_item for cart_item in cart if cart_item["product_id"] == replace_data.current_product_id),
+        None
+    )
+
+    if current_item is None:
+        raise HTTPException(status_code=404, detail="Original cart item not found")
+
+    current_product = next(
+        (product for product in products if product["id"] == replace_data.current_product_id),
+        None
+    )
+
+    recommended_product = next(
+        (product for product in products if product["id"] == replace_data.recommended_product_id),
+        None
+    )
+
+    if current_product is None or recommended_product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    if current_product["product_key"] != recommended_product["product_key"]:
+        raise HTTPException(status_code=400, detail="Replacement product must be the same product type")
+
+    if recommended_product["price"] >= current_product["price"]:
+        raise HTTPException(status_code=400, detail="Recommended product is not cheaper than current product")
+
+    replacement_quantity = replace_data.quantity or current_item["quantity"]
+
+    cart.remove(current_item)
+
+    existing_recommended_item = next(
+        (cart_item for cart_item in cart if cart_item["product_id"] == replace_data.recommended_product_id),
+        None
+    )
+
+    if existing_recommended_item:
+        existing_recommended_item["quantity"] += replacement_quantity
+    else:
+        cart.append({
+            "product_id": replace_data.recommended_product_id,
+            "quantity": replacement_quantity
+        })
+
+    saving_per_item = current_product["price"] - recommended_product["price"]
+    total_saving = saving_per_item * replacement_quantity
+
+    cart_result = get_cart_product_details()
+    ai_price_recommendations = get_ai_price_recommendations()
+    ai_product_recommendations = get_ai_product_recommendations()
+
+    return {
+        "message": "Cart item replaced with cheaper same product",
+        "message_ko": "더 저렴한 동일 상품으로 교체되었습니다.",
+        "replaced_product": {
+            "product_id": current_product["id"],
+            "name": current_product["name"],
+            "name_ko": current_product["name_ko"],
+            "price": current_product["price"],
+            "shop_id": current_product["shop_id"]
+        },
+        "new_product": {
+            "product_id": recommended_product["id"],
+            "name": recommended_product["name"],
+            "name_ko": recommended_product["name_ko"],
+            "price": recommended_product["price"],
+            "shop_id": recommended_product["shop_id"]
+        },
+        "quantity": replacement_quantity,
+        "saving_per_item": saving_per_item,
+        "total_saving": total_saving,
+        "cart": cart_result,
+        "ai_price_recommendations": ai_price_recommendations,
         "ai_product_recommendations": ai_product_recommendations
     }
 
