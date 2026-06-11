@@ -1487,6 +1487,20 @@ def get_rider_route_result():
         if order["order_id"] not in rider_state["active_batch_order_ids"]
     ])
 
+    active_batch_order_count = len(active_batch_orders)
+    active_batch_item_count = sum(
+        item["quantity"]
+        for order in active_batch_orders
+        for item in order["items"]
+    )
+    active_batch_shop_count = len(target_shops)
+    active_batch_id = "-"
+
+    if rider_state["active_batch_order_ids"]:
+        active_batch_id = "BATCH-" + "-".join(
+            str(order_id) for order_id in rider_state["active_batch_order_ids"]
+        )
+
     route_result = calculate_route(start, target_shops, return_to_hub=True)
 
     return {
@@ -1499,6 +1513,11 @@ def get_rider_route_result():
         "rider_current_location": rider_state["current_location"],
         "rider_last_location_update_at": rider_state["last_location_update_at"],
         "active_batch_order_ids": rider_state["active_batch_order_ids"],
+        "active_batch_id": active_batch_id,
+        "active_batch_order_count": active_batch_order_count,
+        "active_batch_item_count": active_batch_item_count,
+        "active_batch_shop_count": active_batch_shop_count,
+        "order_numbers": rider_state["active_batch_order_ids"],
         "active_batch_started_at": rider_state["active_batch_started_at"],
         "waiting_order_count": waiting_order_count,
         "pending_order_count": len(pending_orders),
@@ -1738,7 +1757,385 @@ def complete_order(order_id: int):
         "updated_route": updated_route
     }
 
+@app.post("/api/runner/login")
+def login_runner(payload: dict):
+    runner_id = (
+        payload.get("runnerId")
+        or payload.get("runner_id")
+        or payload.get("username")
+        or payload.get("id")
+    )
+    password = (
+        payload.get("password")
+        or payload.get("runnerPassword")
+        or payload.get("userPassword")
+    )
 
+    if runner_id == "test" and password == "test1":
+        return {
+            "success": True,
+            "message": "Runner login successful",
+            "user": {
+                "id": "test",
+                "runnerId": "test",
+                "runnerName": "테스트 러너",
+                "name": "테스트 러너",
+                "organization": "merchant_association",
+                "organizationName": "상인회 러너팀",
+                "role": "MARKET_RUNNER"
+            }
+        }
+
+    raise HTTPException(status_code=401, detail="Invalid runner ID or password")
+
+
+def build_runner_batch_response(runner_id: str):
+    rider_result = get_rider_route_result()
+    active_orders = rider_result["active_batch_orders"]
+
+    runner_orders = []
+
+    for order in active_orders:
+        runner_orders.append({
+            "orderId": f"ORD-{str(order['order_id']).zfill(4)}",
+            "backendOrderId": order["order_id"],
+            "orderTime": order["created_at"][11:16] if len(order["created_at"]) >= 16 else order["created_at"],
+            "customerAlias": f"고객{str(order['order_id']).zfill(3)}",
+            "items": [
+                {
+                    "product_id": item["product_id"],
+                    "quantity": item["quantity"]
+                }
+                for item in order["items"]
+            ]
+        })
+
+    current_time = datetime.now().strftime("%H:%M")
+
+    return {
+        "batchId": rider_result["active_batch_id"],
+        "runnerId": runner_id,
+        "runnerName": "테스트 러너",
+        "organization": "merchant_association",
+        "organizationName": "상인회 러너팀",
+        "timeSlot": {
+            "start": current_time,
+            "end": current_time,
+            "label": "현재 배치"
+        },
+        "status": "ASSIGNED" if runner_orders else "WAITING",
+        "assignedAt": rider_result["active_batch_started_at"] or rider_result["last_updated_at"],
+        "orders": runner_orders,
+        "summary": {
+            "orderCount": rider_result["active_batch_order_count"],
+            "storeCount": rider_result["active_batch_shop_count"],
+            "itemCount": rider_result["active_batch_item_count"],
+            "orderNumbers": rider_result["order_numbers"]
+        }
+    }
+
+
+def get_runner_shop_name(shop_id):
+    shop = next((s for s in shops if s["id"] == shop_id), None)
+
+    if shop is None:
+        return "상점"
+
+    category_prefix = {
+        "meat": "정육점",
+        "vegetable": "채소가게",
+        "fish": "수산가게",
+        "fruit": "과일가게"
+    }.get(shop["category"], "상점")
+
+    same_category_shops = sorted(
+        [s for s in shops if s["category"] == shop["category"]],
+        key=lambda s: s["id"]
+    )
+
+    shop_number = next(
+        (index + 1 for index, same_shop in enumerate(same_category_shops) if same_shop["id"] == shop_id),
+        shop_id
+    )
+
+    return f"{category_prefix} {shop_number}"
+
+
+def get_runner_access_node_id(shop):
+    aisle_row = "U" if shop["y"] <= 7 else "L"
+    return f"N_{aisle_row}_{shop['x']}"
+
+
+def build_market_products_for_runner():
+    runner_products = []
+
+    for product in products:
+        product_copy = product.copy()
+        product_copy["shop_name_ko"] = get_runner_shop_name(product["shop_id"])
+        runner_products.append(product_copy)
+
+    return runner_products
+
+
+def build_runner_market_map_layout():
+    grid_size = 45
+    x_offset = 90
+    y_offset = 35
+    aisle_columns = [2, 5, 8, 11, 14, 17]
+
+    road_nodes = [
+        {
+            "node_id": "N_HUB",
+            "name": "스마트 허브",
+            "x": HUB_LOCATION["x"] * grid_size + x_offset,
+            "y": HUB_LOCATION["y"] * grid_size + y_offset,
+            "grid_x": HUB_LOCATION["x"],
+            "grid_y": HUB_LOCATION["y"],
+            "node_type": "HUB_NODE"
+        },
+        {
+            "node_id": "N_HUB_GATE",
+            "name": "허브 진입 통로",
+            "x": 2 * grid_size + x_offset,
+            "y": HUB_LOCATION["y"] * grid_size + y_offset,
+            "grid_x": 2,
+            "grid_y": HUB_LOCATION["y"],
+            "node_type": "AISLE_NODE"
+        }
+    ]
+
+    for column in aisle_columns:
+        road_nodes.append({
+            "node_id": f"N_U_{column}",
+            "name": f"상단 통로 {column}",
+            "x": column * grid_size + x_offset,
+            "y": 6 * grid_size + y_offset,
+            "grid_x": column,
+            "grid_y": 6,
+            "node_type": "AISLE_NODE"
+        })
+        road_nodes.append({
+            "node_id": f"N_L_{column}",
+            "name": f"하단 통로 {column}",
+            "x": column * grid_size + x_offset,
+            "y": 8 * grid_size + y_offset,
+            "grid_x": column,
+            "grid_y": 8,
+            "node_type": "AISLE_NODE"
+        })
+
+    road_edges = [
+        {
+            "edge_id": "E_HUB_TO_GATE",
+            "from_node_id": "N_HUB",
+            "to_node_id": "N_HUB_GATE",
+            "distance_meter": 20,
+            "road_type": "HUB_CONNECTOR",
+            "walkable": True
+        },
+        {
+            "edge_id": "E_GATE_TO_UPPER",
+            "from_node_id": "N_HUB_GATE",
+            "to_node_id": "N_U_2",
+            "distance_meter": 10,
+            "road_type": "HUB_CONNECTOR",
+            "walkable": True
+        },
+        {
+            "edge_id": "E_GATE_TO_LOWER",
+            "from_node_id": "N_HUB_GATE",
+            "to_node_id": "N_L_2",
+            "distance_meter": 10,
+            "road_type": "HUB_CONNECTOR",
+            "walkable": True
+        }
+    ]
+
+    for index in range(len(aisle_columns) - 1):
+        current_column = aisle_columns[index]
+        next_column = aisle_columns[index + 1]
+        distance_meter = (next_column - current_column) * 10
+
+        road_edges.append({
+            "edge_id": f"E_U_{current_column}_{next_column}",
+            "from_node_id": f"N_U_{current_column}",
+            "to_node_id": f"N_U_{next_column}",
+            "distance_meter": distance_meter,
+            "road_type": "UPPER_AISLE",
+            "walkable": True
+        })
+        road_edges.append({
+            "edge_id": f"E_L_{current_column}_{next_column}",
+            "from_node_id": f"N_L_{current_column}",
+            "to_node_id": f"N_L_{next_column}",
+            "distance_meter": distance_meter,
+            "road_type": "LOWER_AISLE",
+            "walkable": True
+        })
+        road_edges.append({
+            "edge_id": f"E_CONNECT_{current_column}",
+            "from_node_id": f"N_U_{current_column}",
+            "to_node_id": f"N_L_{current_column}",
+            "distance_meter": 20,
+            "road_type": "VERTICAL_CONNECTOR",
+            "walkable": True
+        })
+
+    last_column = aisle_columns[-1]
+    road_edges.append({
+        "edge_id": f"E_CONNECT_{last_column}",
+        "from_node_id": f"N_U_{last_column}",
+        "to_node_id": f"N_L_{last_column}",
+        "distance_meter": 20,
+        "road_type": "VERTICAL_CONNECTOR",
+        "walkable": True
+    })
+
+    runner_stores = []
+
+    for shop in shops:
+        runner_stores.append({
+            "shop_id": shop["id"],
+            "shop_name": get_runner_shop_name(shop["id"]),
+            "backend_shop_name": shop["name"],
+            "category": shop["category"],
+            "category_ko": {
+                "meat": "정육",
+                "vegetable": "채소",
+                "fish": "수산",
+                "fruit": "과일"
+            }.get(shop["category"], shop["category"]),
+            "x": shop["x"] * grid_size + x_offset,
+            "y": shop["y"] * grid_size + y_offset,
+            "grid_x": shop["x"],
+            "grid_y": shop["y"],
+            "row": 1 if shop["y"] <= 7 else 2,
+            "col": shop["x"],
+            "access_node_id": get_runner_access_node_id(shop)
+        })
+
+    return {
+        "mapId": "BACKEND-MAP-2X6-GRID",
+        "mapName": "백엔드 전통시장 지도",
+        "source": "live_backend_main_py",
+        "description": "현재 백엔드 shops 좌표에서 생성한 러너 지도 데이터입니다.",
+        "coordinateUnit": "backend_grid_to_pixel",
+        "gridSize": grid_size,
+        "xOffset": x_offset,
+        "yOffset": y_offset,
+        "walkSpeedMeterPerMinute": 70,
+        "svgViewBox": {
+            "width": 960,
+            "height": 720
+        },
+        "hub": {
+            "id": "HUB",
+            "name": "스마트 허브",
+            "backend_name": HUB_LOCATION["name"],
+            "x": HUB_LOCATION["x"] * grid_size + x_offset,
+            "y": HUB_LOCATION["y"] * grid_size + y_offset,
+            "grid_x": HUB_LOCATION["x"],
+            "grid_y": HUB_LOCATION["y"],
+            "access_node_id": "N_HUB",
+            "type": "SMART_HUB"
+        },
+        "aisleAreas": [],
+        "roadNodes": road_nodes,
+        "roadEdges": road_edges,
+        "stores": runner_stores
+    }
+
+
+@app.get("/api/runner/{runner_id}/batch/current")
+def get_runner_current_batch(runner_id: str):
+    return build_runner_batch_response(runner_id)
+
+
+@app.get("/api/market/products")
+def get_market_products_for_runner():
+    return build_market_products_for_runner()
+
+
+@app.get("/api/market/map-layout")
+def get_market_map_layout_for_runner():
+    return build_runner_market_map_layout()
+
+
+@app.post("/api/runner/{runner_id}/route/optimize")
+def optimize_runner_route(runner_id: str, payload: dict | None = None):
+    rider_result = get_rider_route_result()
+    layout = build_runner_market_map_layout()
+    store_map = {store["shop_id"]: store for store in layout["stores"]}
+
+    target_stores = []
+    for shop in rider_result["target_shops"]:
+        matched_store = store_map.get(shop["id"])
+        if matched_store:
+            target_stores.append(matched_store)
+
+    route_legs = []
+    current_node_id = layout["hub"]["access_node_id"]
+
+    for index, store in enumerate(target_stores):
+        route_legs.append({
+            "type": "STORE",
+            "sequence": index + 1,
+            "fromNodeId": current_node_id,
+            "toNodeId": store["access_node_id"],
+            "targetShopId": store["shop_id"],
+            "distanceMeter": 30,
+            "pathNodeIds": [current_node_id, store["access_node_id"]],
+            "pathEdgeIds": []
+        })
+        current_node_id = store["access_node_id"]
+
+    if target_stores:
+        route_legs.append({
+            "type": "RETURN_HUB",
+            "sequence": len(target_stores) + 1,
+            "fromNodeId": current_node_id,
+            "toNodeId": layout["hub"]["access_node_id"],
+            "targetShopId": None,
+            "distanceMeter": 30,
+            "pathNodeIds": [current_node_id, layout["hub"]["access_node_id"]],
+            "pathEdgeIds": []
+        })
+
+    return {
+        "success": True,
+        "message": "Runner route optimized",
+        "runnerId": runner_id,
+        "batchId": rider_result["active_batch_id"],
+        "algorithm": "BACKEND_ROUTE_OPTIMIZE",
+        "targetStores": target_stores,
+        "routeLegs": route_legs,
+        "route_result": rider_result["route_result"]
+    }
+
+
+@app.post("/api/runner/batch/{batch_id}/complete")
+def complete_runner_batch(batch_id: str):
+    completed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for order in orders:
+        if order["order_id"] in rider_state["active_batch_order_ids"]:
+            order["status"] = "completed"
+            order["pickup_status"] = "done"
+            order["completed_at"] = completed_at
+
+    completed_order_ids = rider_state["active_batch_order_ids"].copy()
+
+    rider_state["active_batch_order_ids"] = []
+    rider_state["active_batch_started_at"] = None
+    rider_state["current_location"] = HUB_LOCATION.copy()
+
+    return {
+        "success": True,
+        "message": "Runner batch completed",
+        "batch_id": batch_id,
+        "completed_order_ids": completed_order_ids,
+        "completed_at": completed_at
+    }
 @app.get("/rider-monitor", response_class=HTMLResponse)
 def show_rider_monitor():
     rider_result = get_rider_route_result()
@@ -1940,9 +2337,12 @@ def show_rider_monitor():
             <p><strong>Rider current location:</strong> {rider_result["rider_current_location"]["name"]} ({rider_result["rider_current_location"]["x"]}, {rider_result["rider_current_location"]["y"]})</p>
             <p><strong>Route mode:</strong> {rider_result["route_mode"]}</p>
             <p><strong>Pending orders:</strong> {rider_result["pending_order_count"]}</p>
-            <p><strong>Active batch orders:</strong> {rider_result["active_batch_order_ids"]}</p>
+            <p><strong>Batch ID:</strong> {rider_result["active_batch_id"]}</p>
+            <p><strong>Order numbers:</strong> {rider_result["order_numbers"]}</p>
+            <p><strong>Order count:</strong> {rider_result["active_batch_order_count"]}</p>
             <p><strong>New orders waiting for next batch:</strong> {rider_result["waiting_order_count"]}</p>
-            <p><strong>Target shops:</strong> {rider_result["target_shop_count"]}</p>
+            <p><strong>Target shops:</strong> {rider_result["active_batch_shop_count"]}</p>
+            <p><strong>Item count:</strong> {rider_result["active_batch_item_count"]}</p>
             <p><strong>Return-to-hub condition:</strong> {rider_result["return_to_hub_condition"]}</p>
             <p><strong>Route:</strong> {route_names}</p>
             <p><strong>Estimated pickup time:</strong> {rider_result["route_result"]["estimated_time_text"]}</p>
